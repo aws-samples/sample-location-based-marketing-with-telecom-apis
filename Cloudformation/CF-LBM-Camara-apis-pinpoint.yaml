@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: A Template to provision Amazon Pinpoint and other resources for the location based marketing Blog
+
+Resources:
+  # Pinpoint Project
+  PinpointProject:
+    Type: AWS::Pinpoint::App
+    Properties:
+      Name: CoffeeShop
+
+  # Lambda Function Role
+  GeofencingEventHandlerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PinpointAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mobiletargeting:PutEvents
+                Resource: !Sub arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProject}/*
+
+  # Lambda Function
+  GeofencingEventHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt GeofencingEventHandlerLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const { PinpointClient, PutEventsCommand } = require("@aws-sdk/client-pinpoint");
+
+          const pinPointClient = new PinpointClient();
+
+          exports.handler = async (event) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+
+            const camaraNotification = JSON.parse(event.body);
+
+            const phoneNumber = camaraNotification?.data?.device?.phoneNumber;
+            const latitude = camaraNotification?.data?.area?.center?.latitude;
+            const longitude = camaraNotification?.data?.area?.center?.longitude;
+
+            if (!phoneNumber || !latitude || !longitude) {
+              return {
+                statusCode: 400,
+                body: JSON.stringify(
+                  "Request must include phoneNumber, latitude and longitude attributes."
+                ),
+              };
+            }
+
+            const pinPointAppId = process.env.PINPOINT_APP_ID;
+
+            const pinPointEvent = {
+              ApplicationId: pinPointAppId,
+              EventsRequest: {
+                BatchItem: {
+                  [phoneNumber]: {
+                    Endpoint: {
+                      Address: phoneNumber,
+                      ChannelType: "SMS",
+                    },
+                    Events: {
+                      geofence_enter: {
+                        EventType: "geofence_enter",
+                        Timestamp: new Date().toISOString(),
+                        Attributes: {
+                          latitude,
+                          longitude,
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            };
+
+            const putEventsCommand = new PutEventsCommand(pinPointEvent);
+
+            await pinPointClient.send(putEventsCommand);
+
+            const response = {
+              statusCode: 200,
+              body: JSON.stringify("Event Processed."),
+            };
+            return response;
+          };
+      Runtime: nodejs22.x
+      Timeout: 30
+      Environment:
+        Variables:
+          PINPOINT_APP_ID: !Ref PinpointProject
+
+  # API Gateway REST API
+  GeofencingNotificationSinkRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: geofencing-notification-api
+      Description: API to receive geofence events from Camara notification service
+
+  # API Resource
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt GeofencingNotificationSinkRestApi.RootResourceId
+      PathPart: "geofence-events"
+      RestApiId: !Ref GeofencingNotificationSinkRestApi
+
+  # API Method
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref GeofencingNotificationSinkRestApi
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GeofencingEventHandlerFunction.Arn}/invocations
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiMethod
+    Properties:
+      RestApiId: !Ref GeofencingNotificationSinkRestApi
+
+  # API Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref GeofencingNotificationSinkRestApi
+      StageName: test
+
+  # Lambda Permission for API Gateway
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GeofencingEventHandlerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GeofencingNotificationSinkRestApi}/*/*/*
+
+  # WAF Web ACL
+  ApiGatewayWAF:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: ApiGatewayWAFACL
+      Description: WAF Web ACL for API Gateway with trusted IP list
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: ApiGatewayWAFMetrics
+      Rules:
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 0
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesAmazonIpReputationListMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSetMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+
+  # API Gateway Resource Association with WAF
+  ApiGatewayWAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${GeofencingNotificationSinkRestApi}/stages/${ApiStage}
+      WebACLArn: !GetAtt ApiGatewayWAF.Arn
+
+  # IAM role for Simulator Lambda Function
+  CamaraGeofencingSimulatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda Function
+  CamaraGeofencingSimulator:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CamaraGeofencingSimulatorRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log(event);
+
+            if (!event.phoneNumber || !event.latitude || !event.longitude) {
+              return {
+                statusCode: 400,
+                body: JSON.stringify(
+                  "Request must include a phoneNumber, latitude and longitude attributes."
+                ),
+              };
+            }
+
+            const GEOFENCING_NOTIFICATION_URL = process.env.GEOFENCING_NOTIFICATION_URL;
+
+            const camaraEventPL = {
+              id: "123655",
+              source: "https://notificationSendServer12.supertelco.com",
+              type: "org.camaraproject.geofencing-subscriptions.v0.area-entered",
+              specversion: "1.0",
+              datacontenttype: "application/json",
+              time: new Date().toISOString(),
+              data: {
+                subscriptionId: event.phoneNumber,
+                device: {
+                  phoneNumber: event.phoneNumber,
+                },
+                area: {
+                  areaType: "CIRCLE",
+                  center: {
+                    latitude: event.latitude,
+                    longitude: event.longitude,
+                  },
+                  radius: 2000,
+                },
+              },
+            };
+
+            console.log(camaraEventPL);
+
+            const response = await fetch(GEOFENCING_NOTIFICATION_URL, {
+              method: "POST",
+              body: JSON.stringify(camaraEventPL),
+            });
+
+            console.log(response);
+
+            return {
+              statusCode: 200,
+              body: JSON.stringify(camaraEventPL)
+            };
+          };
+      Runtime: nodejs22.x
+      Timeout: 30
+      Environment:
+        Variables:
+          GEOFENCING_NOTIFICATION_URL: !Sub https://${GeofencingNotificationSinkRestApi}.execute-api.${AWS::Region}.amazonaws.com/test/geofence-events
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${GeofencingNotificationSinkRestApi}.execute-api.${AWS::Region}.amazonaws.com/test/geofence-events
+  PinpointProjectId:
+    Description: Pinpoint Project ID
+    Value: !Ref PinpointProject
